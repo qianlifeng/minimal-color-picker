@@ -1,6 +1,8 @@
 # minimal-color-picker
 A minimal cross-platform color picker
 
+![](screenshot.png)
+
 ## build
 ```
 make windows
