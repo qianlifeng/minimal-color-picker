@@ -114,17 +114,10 @@ static void clipboard_set_text_utf16(const wchar_t* text) {
     CloseClipboard();
 }
 
-static BOOL try_use_parent_console_stdout(void) {
-    // Do not create a new console window.
-    if (!GetConsoleWindow()) {
-        if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-            return FALSE;
-        }
-    }
-
-    (void)freopen("CONOUT$", "w", stdout);
-    (void)freopen("CONOUT$", "w", stderr);
-    return TRUE;
+static void ensure_console_output(void) {
+    // For console applications, stdout/stderr are already available
+    // Just ensure they're set to UTF-8 mode for proper output
+    SetConsoleOutputCP(CP_UTF8);
 }
 
 static void copy_color_and_quit(void) {
@@ -143,10 +136,9 @@ static void copy_color_and_quit(void) {
     swprintf(buf, 16, L"#%02X%02X%02X", r, g, b);
     clipboard_set_text_utf16(buf);
 
-    if (try_use_parent_console_stdout()) {
-        wprintf(L"%ls\n", buf);
-        fflush(stdout);
-    }
+    ensure_console_output();
+    wprintf(L"%ls\n", buf);
+    fflush(stdout);
 
     PostQuitMessage(0);
 }
@@ -340,8 +332,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int nCmdShow) {
-    (void)hPrev; (void)lpCmdLine; (void)nCmdShow;
+int wmain(int argc, wchar_t* argv[]) {
+    (void)argc; (void)argv;
+    HINSTANCE hInstance = GetModuleHandleW(NULL);
     g_hInstance = hInstance;
 
     enable_dpi_awareness();
