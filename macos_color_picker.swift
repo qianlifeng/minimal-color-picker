@@ -131,6 +131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var dy: CGFloat = 0
 
         switch event.keyCode {
+        case 36, 76: // return, keypad enter
+            pickAndExit()
+            return
         case 123: dx = -step // left
         case 124: dx = step  // right
         case 125: dy = -step // down

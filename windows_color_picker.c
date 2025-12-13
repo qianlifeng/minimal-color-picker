@@ -172,6 +172,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             POINT p;
 
             switch (ks->vkCode) {
+                case VK_RETURN:
+                    copy_color_and_quit();
+                    return 1;
                 case VK_LEFT:
                     GetCursorPos(&p);
                     SetCursorPos(p.x - step, p.y);
