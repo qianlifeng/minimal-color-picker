@@ -134,8 +134,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var scStream: SCStream?
     private var streamOutput: StreamOutput?
     private var latestFrame: CGImage?
-    private let frameLock = NSLock()
+    private let frameQueue = DispatchQueue(label: "minimalColorPicker.latestFrame")
     private var captureDisplayFrame: CGRect = .zero
+    private var captureDisplayID: CGDirectDisplayID?
+    private let captureSwitchQueue = DispatchQueue(label: "minimalColorPicker.captureSwitch")
+    private var isSwitchingCapture: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -233,43 +236,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 self.scContent = content
 
-                // Choose display containing cursor (Quartz global coordinates)
-                let cursorQ = currentCursorQuartz()
-                guard let display = content.displays.first(where: { $0.frame.contains(cursorQ) }) ?? content.displays.first else {
-                    print("No display found")
-                    return
-                }
+                // Start capturing the display under the cursor.
+                self.switchCaptureDisplayIfNeeded(force: true)
+            } catch {
+                print("ScreenCaptureKit error: \(error)")
+            }
+        }
+    }
 
-                self.captureDisplayFrame = display.frame
-                
-                // Exclude our own window
-                let excludedWindows = content.windows.filter { w in
-                    w.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
+    private func excludedWindowsForCapture() -> [SCWindow] {
+        // When running as a CLI tool, bundleIdentifier may be nil; in that case, don't exclude.
+        guard let content = scContent else { return [] }
+        guard let bundleID = Bundle.main.bundleIdentifier else { return [] }
+        return content.windows.filter { $0.owningApplication?.bundleIdentifier == bundleID }
+    }
+
+    private func switchCaptureDisplayIfNeeded(force: Bool = false) {
+        guard let content = scContent else { return }
+        let cursorQ = currentCursorQuartz()
+        guard let display = content.displays.first(where: { $0.frame.contains(cursorQ) }) ?? content.displays.first else { return }
+
+        let newID = display.displayID
+        if !force, let currentID = captureDisplayID, currentID == newID {
+            return
+        }
+
+        var shouldStart = false
+        captureSwitchQueue.sync {
+            if !isSwitchingCapture {
+                isSwitchingCapture = true
+                shouldStart = true
+            }
+        }
+        if !shouldStart { return }
+
+        Task {
+            defer {
+                captureSwitchQueue.sync {
+                    isSwitchingCapture = false
                 }
-                
-                let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
-                
-                let config = SCStreamConfiguration()
-                config.width = max(1, display.width)
-                config.height = max(1, display.height)
-                config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.showsCursor = false
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-                
-                let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-                self.scStream = stream
-                
-                let output = StreamOutput { [weak self] image in
-                    self?.frameLock.lock()
-                    self?.latestFrame = image
-                    self?.frameLock.unlock()
+            }
+
+            // Stop previous stream (best-effort).
+            if let oldStream = scStream {
+                do {
+                    try await oldStream.stopCapture()
+                } catch {
+                    // Ignore stop errors; we'll attempt to start a new stream anyway.
                 }
-                self.streamOutput = output
-                
+            }
+            scStream = nil
+
+            // Clear stale frame so we don't crop against the wrong display.
+            frameQueue.sync {
+                latestFrame = nil
+            }
+
+            captureDisplayFrame = display.frame
+            captureDisplayID = newID
+
+            let filter = SCContentFilter(display: display, excludingWindows: excludedWindowsForCapture())
+            let config = SCStreamConfiguration()
+            config.width = max(1, display.width)
+            config.height = max(1, display.height)
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.showsCursor = false
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+
+            let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+            scStream = stream
+
+            let output: StreamOutput
+            if let existing = streamOutput {
+                output = existing
+            } else {
+                output = StreamOutput { [weak self] image in
+                    self?.frameQueue.async {
+                        self?.latestFrame = image
+                    }
+                }
+                streamOutput = output
+            }
+
+            do {
                 try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global())
                 try await stream.startCapture()
             } catch {
-                print("ScreenCaptureKit error: \(error)")
+                print("ScreenCaptureKit startCapture error: \(error)")
             }
         }
     }
@@ -306,13 +359,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateFrame() {
+        // Always move the window even if capture/frame isn't ready.
+        positionWindowNearCursor()
+
+        // If the cursor moved to another display, switch the capture stream.
+        switchCaptureDisplayIfNeeded()
+
         let capSize = odd(Int((radius * 2) / zoom))
         let half = CGFloat(capSize / 2)
 
         // Get the latest captured frame
-        frameLock.lock()
-        let fullFrame = latestFrame
-        frameLock.unlock()
+        let fullFrame = frameQueue.sync { latestFrame }
         
         guard let fullFrame = fullFrame else { return }
 
@@ -336,9 +393,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         view.image = scaled
         view.needsDisplay = true
-
-        // Position window near cursor.
-        positionWindowNearCursor()
     }
 
     fileprivate func pickAndExit() {
@@ -346,9 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let relX = cursorQ.x - captureDisplayFrame.origin.x
         let relY = cursorQ.y - captureDisplayFrame.origin.y
 
-        frameLock.lock()
-        let fullFrame = latestFrame
-        frameLock.unlock()
+        let fullFrame = frameQueue.sync { latestFrame }
 
         guard let fullFrame = fullFrame else {
             exitCleanly()
@@ -443,6 +495,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func odd(_ n: Int) -> Int { (n % 2 == 0) ? (n + 1) : n }
 }
+
+extension AppDelegate: @unchecked Sendable {}
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
