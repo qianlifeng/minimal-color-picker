@@ -11,7 +11,7 @@ MAC_APP := color_picker_macos
 MAC_SRC := macos_color_picker.swift
 
 SWIFTC ?= swiftc
-SWIFT_FLAGS ?= -O -framework AppKit -framework CoreGraphics -framework Foundation
+SWIFT_FLAGS ?= -O -framework AppKit -framework CoreGraphics -framework Foundation -framework ScreenCaptureKit
 
 # Default target: build the native binary for the current OS.
 ifeq ($(IS_DARWIN),)

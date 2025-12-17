@@ -1,7 +1,7 @@
 // Minimal Color Picker (macOS, single-file)
 // Build:
 //   swiftc -O macos_color_picker.swift -o color_picker_macos \
-//     -framework AppKit -framework CoreGraphics -framework Foundation
+//     -framework AppKit -framework CoreGraphics -framework Foundation -framework ScreenCaptureKit
 // Run:
 //   ./color_picker_macos
 //
@@ -13,16 +13,68 @@
 // Notes:
 // - On recent macOS versions, global mouse/key monitoring may require
 //   enabling "Input Monitoring" for the terminal/app.
+// - Screen recording permission is required for ScreenCaptureKit.
 
 import AppKit
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
+
+// MARK: - StreamOutput for ScreenCaptureKit
+
+final class StreamOutput: NSObject, SCStreamOutput {
+    private let onFrame: (CGImage) -> Void
+    private let ciContext = CIContext()
+    
+    init(onFrame: @escaping (CGImage) -> Void) {
+        self.onFrame = onFrame
+        super.init()
+    }
+    
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        let ciImage = CIImage(cvPixelBuffer: imageBuffer)
+        let rect = CGRect(x: 0, y: 0,
+                          width: CVPixelBufferGetWidth(imageBuffer),
+                          height: CVPixelBufferGetHeight(imageBuffer))
+        
+        guard let cgImage = ciContext.createCGImage(ciImage, from: rect) else { return }
+        onFrame(cgImage)
+    }
+}
+
+private func eventTapCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let refcon else { return Unmanaged.passUnretained(event) }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+
+    switch type {
+    case .tapDisabledByTimeout, .tapDisabledByUserInput:
+        if let tap = delegate.eventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    case .leftMouseDown:
+        delegate.pickAndExit()
+        return nil
+    case .keyDown:
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        delegate.handleKey(keyCode: Int(keyCode), flags: event.flags)
+        return nil
+    default:
+        return Unmanaged.passUnretained(event)
+    }
+}
 
 final class MagnifierView: NSView {
     var image: CGImage?
     var borderWidth: CGFloat = 2
-
-    override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -75,8 +127,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var view: MagnifierView!
     private var timer: Timer?
 
-    private var globalMouseMonitor: Any?
-    private var globalKeyMonitor: Any?
+    fileprivate var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
+    
+    private var scContent: SCShareableContent?
+    private var scStream: SCStream?
+    private var streamOutput: StreamOutput?
+    private var latestFrame: CGImage?
+    private let frameLock = NSLock()
+    private var captureDisplayFrame: CGRect = .zero
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -101,45 +160,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = view
+
+        // Place the window near the cursor before showing it to avoid a flash at (0,0).
+        positionWindowNearCursor()
         window.makeKeyAndOrderFront(nil)
 
-        // Global monitors
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            self?.pickAndExit()
-        }
+        // Global input (keyboard + click)
+        setupEventTap()
 
-        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            self?.handleKey(event)
-        }
+        // Initialize ScreenCaptureKit
+        setupScreenCapture()
 
         timer = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { [weak self] _ in
             self?.updateFrame()
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        if let m = globalMouseMonitor { NSEvent.removeMonitor(m) }
-        if let k = globalKeyMonitor { NSEvent.removeMonitor(k) }
-        timer?.invalidate()
+    private func positionWindowNearCursor() {
+        let cursorCocoa = NSEvent.mouseLocation
+        let desired = CGPoint(
+            x: cursorCocoa.x + offset.x,
+            y: cursorCocoa.y - offset.y - radius * 2
+        )
+        let clamped = clampToVisible(desiredOrigin: desired, size: CGSize(width: radius * 2, height: radius * 2))
+        window.setFrameOrigin(clamped)
     }
 
-    private func handleKey(_ event: NSEvent) {
-        let step: CGFloat = event.modifierFlags.contains(.shift) ? 5 : 1
-        let loc = NSEvent.mouseLocation // global, origin bottom-left
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        scStream?.stopCapture()
+        stopEventTap()
+    }
+
+    private func setupEventTap() {
+        let mask = (
+            (1 << CGEventType.keyDown.rawValue) |
+            (1 << CGEventType.leftMouseDown.rawValue)
+        )
+
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: eventTapCallback,
+            userInfo: refcon
+        ) else {
+            print("Failed to create event tap. Ensure Input Monitoring/Accessibility permissions are granted.")
+            return
+        }
+
+        eventTap = tap
+        eventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        if let src = eventTapSource {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        }
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func stopEventTap() {
+        if let src = eventTapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+        }
+        eventTapSource = nil
+        eventTap = nil
+    }
+    
+    private func setupScreenCapture() {
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                self.scContent = content
+
+                // Choose display containing cursor (Quartz global coordinates)
+                let cursorQ = currentCursorQuartz()
+                guard let display = content.displays.first(where: { $0.frame.contains(cursorQ) }) ?? content.displays.first else {
+                    print("No display found")
+                    return
+                }
+
+                self.captureDisplayFrame = display.frame
+                
+                // Exclude our own window
+                let excludedWindows = content.windows.filter { w in
+                    w.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
+                }
+                
+                let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+                
+                let config = SCStreamConfiguration()
+                config.width = max(1, display.width)
+                config.height = max(1, display.height)
+                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.showsCursor = false
+                config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+                
+                let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+                self.scStream = stream
+                
+                let output = StreamOutput { [weak self] image in
+                    self?.frameLock.lock()
+                    self?.latestFrame = image
+                    self?.frameLock.unlock()
+                }
+                self.streamOutput = output
+                
+                try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global())
+                try await stream.startCapture()
+            } catch {
+                print("ScreenCaptureKit error: \(error)")
+            }
+        }
+    }
+
+    fileprivate func handleKey(keyCode: Int, flags: CGEventFlags) {
+        let step: CGFloat = flags.contains(.maskShift) ? 5 : 1
+        let loc = currentCursorQuartz() // global, origin top-left
 
         var dx: CGFloat = 0
         var dy: CGFloat = 0
 
-        switch event.keyCode {
+        switch keyCode {
         case 36, 76: // return, keypad enter
             pickAndExit()
             return
         case 123: dx = -step // left
         case 124: dx = step  // right
-        case 125: dy = -step // down
-        case 126: dy = step  // up
-        case 53:  exitCleanly() // esc
-        default: return
+        case 125: dy = step  // down (Quartz y+ is down)
+        case 126: dy = -step // up
+        case 53:
+            exitCleanly()
+            return
+        default:
+            return
         }
 
         let newPoint = CGPoint(x: loc.x + dx, y: loc.y + dy)
@@ -147,34 +301,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CGWarpMouseCursorPosition(newPoint)
     }
 
+    private func currentCursorQuartz() -> CGPoint {
+        CGEvent(source: nil)?.location ?? .zero
+    }
+
     private func updateFrame() {
-        let cursor = NSEvent.mouseLocation
         let capSize = odd(Int((radius * 2) / zoom))
         let half = CGFloat(capSize / 2)
 
-        let srcRectCocoa = CGRect(x: cursor.x - half, y: cursor.y - half, width: CGFloat(capSize), height: CGFloat(capSize))
-        guard let cg = capture(rectCocoa: srcRectCocoa) else { return }
+        // Get the latest captured frame
+        frameLock.lock()
+        let fullFrame = latestFrame
+        frameLock.unlock()
+        
+        guard let fullFrame = fullFrame else { return }
+
+        // Crop in the captured display's logical coordinate system (origin top-left).
+        let cursorQ = currentCursorQuartz()
+        let relX = cursorQ.x - captureDisplayFrame.origin.x
+        let relY = cursorQ.y - captureDisplayFrame.origin.y
+
+        var cropRect = CGRect(x: relX - half, y: relY - half, width: CGFloat(capSize), height: CGFloat(capSize))
+        cropRect = cropRect.integral
+
+        // Clamp to image bounds to avoid nil cropping.
+        let imgBounds = CGRect(x: 0, y: 0, width: fullFrame.width, height: fullFrame.height)
+        let clippedRect = cropRect.intersection(imgBounds)
+        guard !clippedRect.isEmpty, let croppedImage = fullFrame.cropping(to: clippedRect) else { return }
 
         // Scale up by drawing into a new bitmap at window size.
         let dstW = Int(radius * 2)
         let dstH = Int(radius * 2)
-        guard let scaled = scaleNearest(src: cg, dstWidth: dstW, dstHeight: dstH) else { return }
+        guard let scaled = scaleNearest(src: croppedImage, dstWidth: dstW, dstHeight: dstH) else { return }
 
         view.image = scaled
         view.needsDisplay = true
 
-        // Position window near cursor (convert to screen with origin bottom-left)
-        // Window coordinates use bottom-left origin in global.
-        let desired = CGPoint(x: cursor.x + offset.x, y: cursor.y - offset.y - radius * 2) // y: place below-right in Cocoa coords
-        let clamped = clampToVisible(desiredOrigin: desired, size: CGSize(width: radius * 2, height: radius * 2))
-        window.setFrameOrigin(clamped)
+        // Position window near cursor.
+        positionWindowNearCursor()
     }
 
-    private func pickAndExit() {
-        let cursor = NSEvent.mouseLocation
-        let srcRect = CGRect(x: cursor.x, y: cursor.y, width: 1, height: 1)
-        guard let cg = capture(rectCocoa: srcRect),
-              let color = sampleTopLeftPixel(cg) else {
+    fileprivate func pickAndExit() {
+        let cursorQ = currentCursorQuartz()
+        let relX = cursorQ.x - captureDisplayFrame.origin.x
+        let relY = cursorQ.y - captureDisplayFrame.origin.y
+
+        frameLock.lock()
+        let fullFrame = latestFrame
+        frameLock.unlock()
+
+        guard let fullFrame = fullFrame else {
+            exitCleanly()
+            return
+        }
+
+        let imgBounds = CGRect(x: 0, y: 0, width: fullFrame.width, height: fullFrame.height)
+        let sampleRect = CGRect(x: relX, y: relY, width: 1, height: 1).intersection(imgBounds)
+        guard !sampleRect.isEmpty,
+              let croppedImage = fullFrame.cropping(to: sampleRect),
+              let color = sampleTopLeftPixel(croppedImage) else {
             exitCleanly()
             return
         }
@@ -191,25 +376,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func exitCleanly() {
-        if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
-        if let k = globalKeyMonitor { NSEvent.removeMonitor(k); globalKeyMonitor = nil }
         timer?.invalidate(); timer = nil
+        scStream?.stopCapture()
+        stopEventTap()
         NSApp.terminate(nil)
     }
 
-    // MARK: - Capture helpers
-
-    private func capture(rectCocoa: CGRect) -> CGImage? {
-        // Convert Cocoa global coords (origin bottom-left, y up)
-        // to Quartz global display coords (origin top-left of main display, y down).
-        let mainH = CGDisplayBounds(CGMainDisplayID()).height
-
-        let qx = rectCocoa.origin.x
-        let qy = mainH - (rectCocoa.origin.y + rectCocoa.size.height)
-        let qRect = CGRect(x: qx, y: qy, width: rectCocoa.width, height: rectCocoa.height)
-
-        return CGWindowListCreateImage(qRect, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution])
-    }
+    // MARK: - Helpers
 
     private func scaleNearest(src: CGImage, dstWidth: Int, dstHeight: Int) -> CGImage? {
         guard let cs = src.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
