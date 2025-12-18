@@ -461,19 +461,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func sampleTopLeftPixel(_ img: CGImage) -> RGB? {
-        guard let data = img.dataProvider?.data else { return nil }
-        let ptr = CFDataGetBytePtr(data)
-        guard let ptr else { return nil }
+        // Don't assume channel order (RGBA/BGRA/ARGB...) or byte order.
+        // Normalize by drawing into a 1x1 RGBA8(sRGB) bitmap and read back.
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
 
-        // CGWindowListCreateImage typically returns BGRA (byte order varies).
-        // We’ll handle the common 32bpp BGRA case.
-        if img.bitsPerPixel >= 32 {
-            let b = ptr[0]
-            let g = ptr[1]
-            let r = ptr[2]
-            return RGB(r: r, g: g, b: b)
-        }
-        return nil
+        var rgba: [UInt8] = [0, 0, 0, 0]
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let ctx = CGContext(
+            data: &rgba,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: cs,
+            bitmapInfo: bitmapInfo
+        ) else { return nil }
+
+        ctx.interpolationQuality = .none
+        ctx.setShouldAntialias(false)
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+
+        return RGB(r: rgba[0], g: rgba[1], b: rgba[2])
     }
 
     private func clampToVisible(desiredOrigin: CGPoint, size: CGSize) -> CGPoint {
